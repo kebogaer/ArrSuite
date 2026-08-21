@@ -1,0 +1,6 @@
+{
+  "name": "ArrSuite Hub",
+  "description": "Centralized media library management dashboard connecting Overseerr, Radarr, Sonarr, Plex, and qBittorrent with smart IMDb link requesting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
