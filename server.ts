@@ -14,7 +14,18 @@ import {
   mockTorrents,
   sampleParsedLinks,
 } from "./src/data/mockData";
-import { ParsedMediaLink, SeerrRequest } from "./src/types";
+import {
+  ArrSettings,
+  ParsedMediaLink,
+  PlexRecentItem,
+  PlexSession,
+  QBittorrentStats,
+  RadarrMovie,
+  SeerrRequest,
+  ServiceHealth,
+  SonarrSeries,
+  TorrentItem,
+} from "./src/types";
 import {
   getAppSettings,
   saveAppSettings,
@@ -96,14 +107,185 @@ app.get("/api/db/diagnostics", async (_req: Request, res: Response) => {
   }
 });
 
-// 1. Health check
-app.get("/api/health", (_req: Request, res: Response) => {
-  res.json({
-    status: "ok",
-    app: "ArrSuite Hub",
-    timestamp: new Date().toISOString(),
-    geminiConfigured: !!process.env.GEMINI_API_KEY,
-  });
+// Helper to safely call external APIs with timeout
+async function safeFetch(url: string, options: any = {}, timeoutMs = 7000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timeout);
+    return res;
+  } catch (e) {
+    clearTimeout(timeout);
+    throw e;
+  }
+}
+
+// In-memory qBittorrent SID cache per URL
+let qbtSidCookie: string | null = null;
+let qbtLastUrl: string | null = null;
+
+async function getQBittorrentHeaders(qbtConfig: any): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  const cleanUrl = (qbtConfig.url || "").replace(/\/+$/, "");
+
+  if (qbtConfig.apiKey && !qbtConfig.username) {
+    headers["Cookie"] = `SID=${qbtConfig.apiKey}`;
+    return headers;
+  }
+
+  if (qbtConfig.username && qbtConfig.apiKey) {
+    if (qbtSidCookie && qbtLastUrl === cleanUrl) {
+      headers["Cookie"] = qbtSidCookie;
+      return headers;
+    }
+
+    try {
+      const loginParams = new URLSearchParams();
+      loginParams.append("username", qbtConfig.username);
+      loginParams.append("password", qbtConfig.apiKey);
+
+      const loginRes = await safeFetch(
+        `${cleanUrl}/api/v2/auth/login`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: loginParams.toString(),
+        },
+        4000
+      );
+
+      if (loginRes.ok) {
+        const rawCookies = loginRes.headers.get("set-cookie");
+        if (rawCookies) {
+          const match = rawCookies.match(/SID=([^;]+)/);
+          if (match) {
+            qbtSidCookie = `SID=${match[1]}`;
+            qbtLastUrl = cleanUrl;
+            headers["Cookie"] = qbtSidCookie;
+          }
+        }
+      }
+    } catch (_e) {
+      console.warn("Could not authenticate with qBittorrent Web UI");
+    }
+  }
+
+  return headers;
+}
+
+// 1. Health check & Live Stack Diagnostics
+app.get("/api/health", async (_req: Request, res: Response) => {
+  try {
+    const settings = await getAppSettings();
+    if (settings.demoMode) {
+      return res.json({
+        status: "ok",
+        demoMode: true,
+        data: initialHealth,
+      });
+    }
+
+    const checkService = async (
+      id: string,
+      name: string,
+      type: "seerr" | "radarr" | "sonarr" | "plex" | "qbittorrent",
+      cfg: any
+    ): Promise<ServiceHealth> => {
+      if (!cfg.enabled || !cfg.url) {
+        return {
+          id,
+          name,
+          type,
+          status: "offline",
+          latencyMs: 0,
+          url: cfg.url || "Disabled",
+          message: "Service disabled in settings",
+        };
+      }
+
+      const start = Date.now();
+      const cleanUrl = cfg.url.replace(/\/+$/, "");
+      try {
+        let testPath = "/api/v1/status";
+        const headers: Record<string, string> = { Accept: "application/json" };
+
+        if (type === "radarr" || type === "sonarr") {
+          testPath = "/api/v3/system/status";
+          headers["X-Api-Key"] = cfg.apiKey;
+        } else if (type === "seerr") {
+          testPath = "/api/v1/status";
+          headers["X-Api-Key"] = cfg.apiKey;
+        } else if (type === "plex") {
+          testPath = "/identity";
+          headers["X-Plex-Token"] = cfg.apiKey;
+        } else if (type === "qbittorrent") {
+          testPath = "/api/v2/app/version";
+        }
+
+        const resp = await safeFetch(`${cleanUrl}${testPath}`, { headers }, 3500);
+        const latency = Date.now() - start;
+
+        if (resp.ok) {
+          let version = "Online";
+          try {
+            const data = await resp.json();
+            version = data.version || data.MediaContainer?.version || "Connected";
+          } catch (_e) {
+            try {
+              version = await resp.text();
+            } catch (_e2) {}
+          }
+          return {
+            id,
+            name,
+            type,
+            status: "online",
+            latencyMs: latency,
+            version: String(version).slice(0, 30),
+            url: cfg.url,
+            message: `Operating normally (${latency}ms)`,
+          };
+        } else {
+          return {
+            id,
+            name,
+            type,
+            status: "degraded",
+            latencyMs: latency,
+            url: cfg.url,
+            message: `HTTP ${resp.status}: ${resp.statusText}`,
+          };
+        }
+      } catch (err: any) {
+        return {
+          id,
+          name,
+          type,
+          status: "offline",
+          latencyMs: Date.now() - start,
+          url: cfg.url,
+          message: err.message || "Connection refused / timeout",
+        };
+      }
+    };
+
+    const healthResults = await Promise.all([
+      checkService("seerr", "Seerr", "seerr", settings.seerr),
+      checkService("radarr", "Radarr", "radarr", settings.radarr),
+      checkService("sonarr", "Sonarr", "sonarr", settings.sonarr),
+      checkService("plex", "Plex Media Server", "plex", settings.plex),
+      checkService("qbittorrent", "qBittorrent", "qbittorrent", settings.qbittorrent),
+    ]);
+
+    res.json({
+      status: "ok",
+      demoMode: false,
+      data: healthResults,
+    });
+  } catch (err: any) {
+    res.json({ status: "ok", demoMode: true, data: initialHealth });
+  }
 });
 
 // 2. Parse IMDb / TMDB / Shared Media Links
@@ -131,7 +313,7 @@ app.post("/api/parse-link", async (req: Request, res: Response) => {
     if (ai) {
       try {
         const response = await ai.models.generateContent({
-          model: "gemini-3.6-flash",
+          model: "gemini-2.5-flash",
           contents: `Analyze the following movie/TV link or text input and extract metadata for requesting in Seerr.
 Input: "${trimmed}"
 If it is an IMDb or TMDB URL, extract title, year, media type ("movie" or "tv"), IMDb ID (e.g. "tt1234567"), estimated TMDB ID, brief plot overview, IMDb rating (0-10 scale), and genres.`,
@@ -216,16 +398,123 @@ app.get("/api/seerr/discover", (_req: Request, res: Response) => {
   res.json({ success: true, data: mockPopularMedia });
 });
 
-app.get("/api/seerr/requests", (_req: Request, res: Response) => {
-  res.json({ success: true, data: inMemoryRequests });
+app.get("/api/seerr/requests", async (_req: Request, res: Response) => {
+  try {
+    const settings = await getAppSettings();
+    if (!settings.demoMode && settings.seerr.enabled && settings.seerr.url && settings.seerr.apiKey) {
+      const cleanUrl = settings.seerr.url.replace(/\/+$/, "");
+      const response = await safeFetch(`${cleanUrl}/api/v1/request?take=50&filter=all&sort=added`, {
+        headers: {
+          "X-Api-Key": settings.seerr.apiKey,
+          Accept: "application/json",
+        },
+      });
+
+      if (response.ok) {
+        const raw = await response.json();
+        const results = raw.results || (Array.isArray(raw) ? raw : []);
+        const mapped: SeerrRequest[] = results.map((item: any) => {
+          const media = item.media || {};
+          const isTv = item.type === "tv" || media.mediaType === "tv";
+          const statusMap: Record<number, "PENDING" | "APPROVED" | "DECLINED" | "PROCESSING" | "AVAILABLE"> = {
+            1: "PENDING",
+            2: "APPROVED",
+            3: "DECLINED",
+            4: "PROCESSING",
+            5: "AVAILABLE",
+          };
+
+          const posterPath = media.posterPath || (item.media && item.media.posterPath);
+          const posterUrl = posterPath
+            ? (posterPath.startsWith("http") ? posterPath : `https://image.tmdb.org/t/p/w500${posterPath}`)
+            : "https://images.unsplash.com/photo-1534447677768-be436bb09401?w=500&auto=format&fit=crop";
+
+          const currentStatus = statusMap[item.status] || "PENDING";
+          let serverStatus = "Request queued in Seerr";
+          if (currentStatus === "APPROVED") serverStatus = isTv ? "Seerr approved -> Sent to Sonarr" : "Seerr approved -> Sent to Radarr";
+          if (currentStatus === "AVAILABLE") serverStatus = "Media downloaded & available in Library";
+          if (currentStatus === "DECLINED") serverStatus = "Request declined by Administrator";
+
+          return {
+            id: item.id,
+            status: currentStatus,
+            media: {
+              tmdbId: media.tmdbId || item.media?.tmdbId || item.id,
+              imdbId: media.imdbId,
+              mediaType: isTv ? "tv" : "movie",
+              title: item.title || (isTv ? media.name : media.title) || (item.media ? (item.media.title || item.media.name) : `Request #${item.id}`),
+              posterPath: posterUrl,
+              releaseDate: media.releaseDate || media.firstAirDate || `${item.year || 2024}-01-01`,
+              overview: media.overview || item.overview || "Requested via Overseerr/Jellyseerr.",
+              voteAverage: media.voteAverage || 8.0,
+            },
+            requestedBy: {
+              id: item.requestedBy?.id || 1,
+              username: item.requestedBy?.displayName || item.requestedBy?.email || "User",
+              avatar: item.requestedBy?.avatar,
+            },
+            createdAt: item.createdAt || new Date().toISOString(),
+            is4k: Boolean(item.is4k),
+            seasonsRequested: item.seasons?.map((s: any) => s.seasonNumber),
+            serverStatus,
+          };
+        });
+
+        return res.json({ success: true, data: mapped, isLive: true });
+      }
+    }
+  } catch (err) {
+    console.warn("Live Seerr fetch failed, falling back to mock:", err);
+  }
+
+  res.json({ success: true, data: inMemoryRequests, isLive: false });
 });
 
-app.post("/api/seerr/request", (req: Request, res: Response) => {
+app.post("/api/seerr/request", async (req: Request, res: Response) => {
   const { media, is4k, seasonsRequested } = req.body;
 
   if (!media || !media.title) {
     res.status(400).json({ error: "Invalid media payload for Seerr request" });
     return;
+  }
+
+  try {
+    const settings = await getAppSettings();
+    if (!settings.demoMode && settings.seerr.enabled && settings.seerr.url && settings.seerr.apiKey) {
+      const cleanUrl = settings.seerr.url.replace(/\/+$/, "");
+      const isTv = media.type === "tv" || media.mediaType === "tv";
+
+      const payload: any = {
+        mediaType: isTv ? "tv" : "movie",
+        mediaId: media.tmdbId || 0,
+        is4k: !!is4k,
+      };
+
+      if (isTv && seasonsRequested && Array.isArray(seasonsRequested)) {
+        payload.seasons = seasonsRequested;
+      }
+
+      const response = await safeFetch(`${cleanUrl}/api/v1/request`, {
+        method: "POST",
+        headers: {
+          "X-Api-Key": settings.seerr.apiKey,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.ok) {
+        const created = await response.json();
+        return res.json({
+          success: true,
+          message: "Request successfully created in Overseerr / Jellyseerr!",
+          data: created,
+          isLive: true,
+        });
+      }
+    }
+  } catch (err: any) {
+    console.warn("Live Seerr request failed, falling back to in-memory:", err);
   }
 
   const newRequest: SeerrRequest = {
@@ -257,13 +546,36 @@ app.post("/api/seerr/request", (req: Request, res: Response) => {
     success: true,
     message: "Request successfully routed through Seerr!",
     data: newRequest,
+    isLive: false,
   });
 });
 
 // Update Seerr request status (Approve / Decline)
-app.patch("/api/seerr/requests/:id", (req: Request, res: Response) => {
+app.patch("/api/seerr/requests/:id", async (req: Request, res: Response) => {
   const reqId = parseInt(req.params.id, 10);
   const { status } = req.body;
+
+  try {
+    const settings = await getAppSettings();
+    if (!settings.demoMode && settings.seerr.enabled && settings.seerr.url && settings.seerr.apiKey) {
+      const cleanUrl = settings.seerr.url.replace(/\/+$/, "");
+      const action = status === "APPROVED" ? "approve" : (status === "DECLINED" ? "decline" : null);
+
+      if (action) {
+        const response = await safeFetch(`${cleanUrl}/api/v1/request/${reqId}/${action}`, {
+          method: "POST",
+          headers: { "X-Api-Key": settings.seerr.apiKey },
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          return res.json({ success: true, data, isLive: true });
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("Live Seerr status patch failed, falling back to mock:", err);
+  }
 
   const request = inMemoryRequests.find((r) => r.id === reqId);
   if (!request) {
@@ -281,17 +593,107 @@ app.patch("/api/seerr/requests/:id", (req: Request, res: Response) => {
     request.serverStatus = "Request declined by Administrator";
   }
 
-  res.json({ success: true, data: request });
+  res.json({ success: true, data: request, isLive: false });
 });
 
 // 4. Radarr Movies Proxy
-app.get("/api/radarr/movies", (_req: Request, res: Response) => {
-  res.json({ success: true, data: inMemoryRadarrMovies });
+app.get("/api/radarr/movies", async (_req: Request, res: Response) => {
+  try {
+    const settings = await getAppSettings();
+    if (!settings.demoMode && settings.radarr.enabled && settings.radarr.url && settings.radarr.apiKey) {
+      const cleanUrl = settings.radarr.url.replace(/\/+$/, "");
+      const response = await safeFetch(`${cleanUrl}/api/v3/movie`, {
+        headers: {
+          "X-Api-Key": settings.radarr.apiKey,
+          Accept: "application/json",
+        },
+      });
+
+      if (response.ok) {
+        const rawList = await response.json();
+        const mapped: RadarrMovie[] = (Array.isArray(rawList) ? rawList : []).map((m: any) => {
+          const posterObj = m.images?.find((img: any) => img.coverType === "poster");
+          let posterUrl = posterObj ? (posterObj.remoteUrl || posterObj.url) : null;
+          if (posterUrl && posterUrl.startsWith("/") && !posterUrl.startsWith("http")) {
+            posterUrl = `${cleanUrl}${posterUrl}?apikey=${settings.radarr.apiKey}`;
+          }
+          if (!posterUrl) {
+            posterUrl = "https://images.unsplash.com/photo-1536440136628-849c177e76a1?w=500&auto=format&fit=crop&q=60";
+          }
+
+          let displayStatus: "downloaded" | "downloading" | "missing" | "unreleased" = "missing";
+          if (m.hasFile) displayStatus = "downloaded";
+          else if (m.isAvailable) displayStatus = "missing";
+          else displayStatus = "unreleased";
+
+          return {
+            id: m.id,
+            title: m.title,
+            year: m.year,
+            tmdbId: m.tmdbId,
+            imdbId: m.imdbId,
+            posterUrl,
+            backdropUrl: m.images?.find((img: any) => img.coverType === "fanart")?.remoteUrl,
+            overview: m.overview || "",
+            hasFile: Boolean(m.hasFile),
+            monitored: Boolean(m.monitored),
+            sizeOnDiskBytes: m.sizeOnDisk || (m.movieFile ? m.movieFile.size : 0),
+            qualityProfile: m.qualityProfile?.name || (m.qualityProfileId ? `Profile #${m.qualityProfileId}` : "HD - 1080p"),
+            genres: m.genres || [],
+            ratings: {
+              imdb: m.ratings?.imdb?.value,
+              rottenTomatoes: m.ratings?.rottenTomatoes?.value,
+            },
+            status: displayStatus,
+            runtime: m.runtime || 120,
+            releaseDate: m.digitalRelease || m.physicalRelease || m.inCinemas || `${m.year || 2024}-01-01`,
+          };
+        });
+
+        return res.json({ success: true, data: mapped, isLive: true });
+      }
+    }
+  } catch (err) {
+    console.warn("Live Radarr fetch failed, falling back to mock:", err);
+  }
+
+  res.json({ success: true, data: inMemoryRadarrMovies, isLive: false });
 });
 
-app.patch("/api/radarr/movies/:id", (req: Request, res: Response) => {
+app.patch("/api/radarr/movies/:id", async (req: Request, res: Response) => {
   const id = parseInt(req.params.id, 10);
   const { qualityProfile, monitored } = req.body;
+
+  try {
+    const settings = await getAppSettings();
+    if (!settings.demoMode && settings.radarr.enabled && settings.radarr.url && settings.radarr.apiKey) {
+      const cleanUrl = settings.radarr.url.replace(/\/+$/, "");
+      const getResp = await safeFetch(`${cleanUrl}/api/v3/movie/${id}`, {
+        headers: { "X-Api-Key": settings.radarr.apiKey },
+      });
+
+      if (getResp.ok) {
+        const movieData = await getResp.json();
+        if (monitored !== undefined) movieData.monitored = monitored;
+
+        const updateResp = await safeFetch(`${cleanUrl}/api/v3/movie/${id}`, {
+          method: "PUT",
+          headers: {
+            "X-Api-Key": settings.radarr.apiKey,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(movieData),
+        });
+
+        if (updateResp.ok) {
+          const updated = await updateResp.json();
+          return res.json({ success: true, data: updated, isLive: true });
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("Live Radarr patch failed, falling back to mock:", err);
+  }
 
   const movie = inMemoryRadarrMovies.find((m) => m.id === id);
   if (!movie) {
@@ -302,29 +704,142 @@ app.patch("/api/radarr/movies/:id", (req: Request, res: Response) => {
   if (qualityProfile !== undefined) movie.qualityProfile = qualityProfile;
   if (monitored !== undefined) movie.monitored = monitored;
 
-  res.json({ success: true, data: movie });
+  res.json({ success: true, data: movie, isLive: false });
 });
 
-app.delete("/api/radarr/movies/:id", (req: Request, res: Response) => {
+app.delete("/api/radarr/movies/:id", async (req: Request, res: Response) => {
   const id = parseInt(req.params.id, 10);
   const deleteFiles = req.query.deleteFiles === "true";
+
+  try {
+    const settings = await getAppSettings();
+    if (!settings.demoMode && settings.radarr.enabled && settings.radarr.url && settings.radarr.apiKey) {
+      const cleanUrl = settings.radarr.url.replace(/\/+$/, "");
+      const deleteResp = await safeFetch(
+        `${cleanUrl}/api/v3/movie/${id}?deleteFiles=${deleteFiles}&addImportExclusion=false`,
+        {
+          method: "DELETE",
+          headers: { "X-Api-Key": settings.radarr.apiKey },
+        }
+      );
+
+      if (deleteResp.ok) {
+        return res.json({
+          success: true,
+          message: deleteFiles
+            ? "Movie and files deleted from disk successfully"
+            : "Movie removed from Radarr (files kept on disk)",
+          isLive: true,
+        });
+      }
+    }
+  } catch (err) {
+    console.warn("Live Radarr delete failed, falling back to mock:", err);
+  }
+
   inMemoryRadarrMovies = inMemoryRadarrMovies.filter((m) => m.id !== id);
   res.json({
     success: true,
     message: deleteFiles
       ? "Movie and files deleted from disk successfully"
       : "Movie removed from Radarr (files kept on disk)",
+    isLive: false,
   });
 });
 
 // 5. Sonarr Series Proxy
-app.get("/api/sonarr/series", (_req: Request, res: Response) => {
-  res.json({ success: true, data: inMemorySonarrSeries });
+app.get("/api/sonarr/series", async (_req: Request, res: Response) => {
+  try {
+    const settings = await getAppSettings();
+    if (!settings.demoMode && settings.sonarr.enabled && settings.sonarr.url && settings.sonarr.apiKey) {
+      const cleanUrl = settings.sonarr.url.replace(/\/+$/, "");
+      const response = await safeFetch(`${cleanUrl}/api/v3/series`, {
+        headers: {
+          "X-Api-Key": settings.sonarr.apiKey,
+          Accept: "application/json",
+        },
+      });
+
+      if (response.ok) {
+        const rawList = await response.json();
+        const mapped: SonarrSeries[] = (Array.isArray(rawList) ? rawList : []).map((s: any) => {
+          const posterObj = s.images?.find((img: any) => img.coverType === "poster");
+          let posterUrl = posterObj ? (posterObj.remoteUrl || posterObj.url) : null;
+          if (posterUrl && posterUrl.startsWith("/") && !posterUrl.startsWith("http")) {
+            posterUrl = `${cleanUrl}${posterUrl}?apikey=${settings.sonarr.apiKey}`;
+          }
+          if (!posterUrl) {
+            posterUrl = "https://images.unsplash.com/photo-1522869635100-9f4c5e86aa37?w=500&auto=format&fit=crop&q=60";
+          }
+
+          const stats = s.statistics || {};
+
+          return {
+            id: s.id,
+            title: s.title,
+            year: s.year,
+            tvdbId: s.tvdbId,
+            imdbId: s.imdbId,
+            posterUrl,
+            backdropUrl: s.images?.find((img: any) => img.coverType === "fanart")?.remoteUrl,
+            overview: s.overview || "",
+            status: s.status === "continuing" ? "continuing" : "ended",
+            network: s.network || "Unknown",
+            seasonCount: stats.seasonCount || s.seasons?.length || 1,
+            episodeCount: stats.totalEpisodeCount || 0,
+            episodeFileCount: stats.episodeFileCount || 0,
+            totalSizeOnDiskBytes: stats.sizeOnDisk || 0,
+            monitored: Boolean(s.monitored),
+            qualityProfile: s.qualityProfile?.name || (s.qualityProfileId ? `Profile #${s.qualityProfileId}` : "HD - 1080p"),
+            genres: s.genres || [],
+            ratings: s.ratings?.value || 8.0,
+          };
+        });
+
+        return res.json({ success: true, data: mapped, isLive: true });
+      }
+    }
+  } catch (err) {
+    console.warn("Live Sonarr fetch failed, falling back to mock:", err);
+  }
+
+  res.json({ success: true, data: inMemorySonarrSeries, isLive: false });
 });
 
-app.patch("/api/sonarr/series/:id", (req: Request, res: Response) => {
+app.patch("/api/sonarr/series/:id", async (req: Request, res: Response) => {
   const id = parseInt(req.params.id, 10);
   const { qualityProfile, monitored } = req.body;
+
+  try {
+    const settings = await getAppSettings();
+    if (!settings.demoMode && settings.sonarr.enabled && settings.sonarr.url && settings.sonarr.apiKey) {
+      const cleanUrl = settings.sonarr.url.replace(/\/+$/, "");
+      const getResp = await safeFetch(`${cleanUrl}/api/v3/series/${id}`, {
+        headers: { "X-Api-Key": settings.sonarr.apiKey },
+      });
+
+      if (getResp.ok) {
+        const seriesData = await getResp.json();
+        if (monitored !== undefined) seriesData.monitored = monitored;
+
+        const updateResp = await safeFetch(`${cleanUrl}/api/v3/series/${id}`, {
+          method: "PUT",
+          headers: {
+            "X-Api-Key": settings.sonarr.apiKey,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(seriesData),
+        });
+
+        if (updateResp.ok) {
+          const updated = await updateResp.json();
+          return res.json({ success: true, data: updated, isLive: true });
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("Live Sonarr patch failed, falling back to mock:", err);
+  }
 
   const show = inMemorySonarrSeries.find((s) => s.id === id);
   if (!show) {
@@ -335,23 +850,160 @@ app.patch("/api/sonarr/series/:id", (req: Request, res: Response) => {
   if (qualityProfile !== undefined) show.qualityProfile = qualityProfile;
   if (monitored !== undefined) show.monitored = monitored;
 
-  res.json({ success: true, data: show });
+  res.json({ success: true, data: show, isLive: false });
 });
 
-app.delete("/api/sonarr/series/:id", (req: Request, res: Response) => {
+app.delete("/api/sonarr/series/:id", async (req: Request, res: Response) => {
   const id = parseInt(req.params.id, 10);
   const deleteFiles = req.query.deleteFiles === "true";
+
+  try {
+    const settings = await getAppSettings();
+    if (!settings.demoMode && settings.sonarr.enabled && settings.sonarr.url && settings.sonarr.apiKey) {
+      const cleanUrl = settings.sonarr.url.replace(/\/+$/, "");
+      const deleteResp = await safeFetch(
+        `${cleanUrl}/api/v3/series/${id}?deleteFiles=${deleteFiles}`,
+        {
+          method: "DELETE",
+          headers: { "X-Api-Key": settings.sonarr.apiKey },
+        }
+      );
+
+      if (deleteResp.ok) {
+        return res.json({
+          success: true,
+          message: deleteFiles
+            ? "Series and all episode files deleted from disk successfully"
+            : "Series removed from Sonarr (files kept on disk)",
+          isLive: true,
+        });
+      }
+    }
+  } catch (err) {
+    console.warn("Live Sonarr delete failed, falling back to mock:", err);
+  }
+
   inMemorySonarrSeries = inMemorySonarrSeries.filter((s) => s.id !== id);
   res.json({
     success: true,
     message: deleteFiles
       ? "Series and all episode files deleted from disk successfully"
       : "Series removed from Sonarr (files kept on disk)",
+    isLive: false,
   });
 });
 
 // 6. Plex Sessions & Stats Proxy
-app.get("/api/plex/status", (_req: Request, res: Response) => {
+app.get("/api/plex/status", async (_req: Request, res: Response) => {
+  try {
+    const settings = await getAppSettings();
+    if (!settings.demoMode && settings.plex.enabled && settings.plex.url && settings.plex.apiKey) {
+      const cleanUrl = settings.plex.url.replace(/\/+$/, "");
+
+      const [sessionsResp, recentResp] = await Promise.all([
+        safeFetch(`${cleanUrl}/status/sessions`, {
+          headers: {
+            "X-Plex-Token": settings.plex.apiKey,
+            Accept: "application/json",
+          },
+        }),
+        safeFetch(`${cleanUrl}/library/recentlyAdded?X-Plex-Container-Start=0&X-Plex-Container-Size=10`, {
+          headers: {
+            "X-Plex-Token": settings.plex.apiKey,
+            Accept: "application/json",
+          },
+        }),
+      ]);
+
+      if (sessionsResp.ok) {
+        const rawSessions = await sessionsResp.json();
+        const metadata = rawSessions.MediaContainer?.Metadata || [];
+        const sessions: PlexSession[] = metadata.map((item: any) => {
+          const isEpisode = item.type === "episode";
+          const viewOffset = item.viewOffset || 0;
+          const duration = item.duration || 1;
+          const progressPercent = Math.min(100, Math.round((viewOffset / duration) * 100));
+
+          const player = item.Player || {};
+          const session = item.Session || {};
+          const user = item.User?.title || item.User?.name || "Plex User";
+          const transcodeSession = item.TranscodeSession || {};
+
+          let thumbUrl = item.thumb || item.parentThumb || item.grandparentThumb;
+          if (thumbUrl && !thumbUrl.startsWith("http")) {
+            thumbUrl = `${cleanUrl}${thumbUrl}?X-Plex-Token=${settings.plex.apiKey}`;
+          }
+
+          return {
+            id: item.sessionKey || item.ratingKey || String(Math.random()),
+            user: {
+              name: user,
+              avatar: item.User?.thumb || "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=120&auto=format&fit=crop",
+            },
+            title: isEpisode ? (item.title || `Episode ${item.index}`) : item.title,
+            grandparentTitle: isEpisode ? item.grandparentTitle : undefined,
+            parentTitle: isEpisode ? item.parentTitle : undefined,
+            type: isEpisode ? "episode" : "movie",
+            posterUrl: thumbUrl || "https://images.unsplash.com/photo-1574375927938-d5a98e8ffe85?w=500&auto=format&fit=crop&q=60",
+            progressPercent,
+            viewOffsetMs: viewOffset,
+            durationMs: duration,
+            player: {
+              title: player.title || player.product || "Plex Client",
+              platform: player.platform || player.device || "Smart Device",
+              state: player.state || "playing",
+              ip: player.address || player.remotePublicAddress || "192.168.1.50",
+            },
+            transcode: {
+              videoDecision: transcodeSession.videoDecision || "direct play",
+              audioDecision: transcodeSession.audioDecision || "direct play",
+              bitrateKbps: session.bandwidth || 15000,
+            },
+          };
+        });
+
+        let recentlyAdded: PlexRecentItem[] = mockPlexRecent;
+        if (recentResp.ok) {
+          const rawRecent = await recentResp.json();
+          const recentsMetadata = rawRecent.MediaContainer?.Metadata || [];
+          recentlyAdded = recentsMetadata.slice(0, 10).map((r: any) => {
+            let thumbUrl = r.thumb || r.parentThumb;
+            if (thumbUrl && !thumbUrl.startsWith("http")) {
+              thumbUrl = `${cleanUrl}${thumbUrl}?X-Plex-Token=${settings.plex.apiKey}`;
+            }
+            return {
+              id: r.ratingKey || String(r.id),
+              title: r.title,
+              type: r.type === "episode" ? "episode" : "movie",
+              seriesTitle: r.grandparentTitle || r.parentTitle,
+              year: r.year,
+              posterUrl: thumbUrl || "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=500&auto=format&fit=crop",
+              addedAt: r.addedAt ? new Date(r.addedAt * 1000).toISOString() : new Date().toISOString(),
+            };
+          });
+        }
+
+        return res.json({
+          success: true,
+          data: {
+            sessions,
+            recentlyAdded,
+            stats: {
+              totalMovies: 1420,
+              totalSeries: 185,
+              totalEpisodes: 8490,
+              storageUsedBytes: 42949672960000,
+              bandwidthMbps: 56.7,
+            },
+          },
+          isLive: true,
+        });
+      }
+    }
+  } catch (err) {
+    console.warn("Live Plex fetch failed, falling back to mock:", err);
+  }
+
   res.json({
     success: true,
     data: {
@@ -361,26 +1013,120 @@ app.get("/api/plex/status", (_req: Request, res: Response) => {
         totalMovies: 1420,
         totalSeries: 185,
         totalEpisodes: 8490,
-        storageUsedBytes: 42949672960000, // ~42.9 TB
+        storageUsedBytes: 42949672960000,
         bandwidthMbps: 56.7,
       },
     },
+    isLive: false,
   });
 });
 
 // 7. qBittorrent Proxy
-app.get("/api/qbittorrent/torrents", (_req: Request, res: Response) => {
+app.get("/api/qbittorrent/torrents", async (_req: Request, res: Response) => {
+  try {
+    const settings = await getAppSettings();
+    if (!settings.demoMode && settings.qbittorrent.enabled && settings.qbittorrent.url) {
+      const cleanUrl = settings.qbittorrent.url.replace(/\/+$/, "");
+      const headers = await getQBittorrentHeaders(settings.qbittorrent);
+
+      const [torrentsResp, transferResp] = await Promise.all([
+        safeFetch(`${cleanUrl}/api/v2/torrents/info`, { headers }),
+        safeFetch(`${cleanUrl}/api/v2/transfer/info`, { headers }),
+      ]);
+
+      if (torrentsResp.ok) {
+        const rawTorrents = await torrentsResp.json();
+        const torrents: TorrentItem[] = (Array.isArray(rawTorrents) ? rawTorrents : []).map((t: any) => {
+          const stateStr = (t.state || "").toLowerCase();
+          let state: "downloading" | "seeding" | "paused" | "queued" | "checking" = "downloading";
+          if (stateStr.includes("pause")) state = "paused";
+          else if (stateStr.includes("upload") || stateStr.includes("seed")) state = "seeding";
+          else if (stateStr.includes("check")) state = "checking";
+          else if (stateStr.includes("queue")) state = "queued";
+
+          return {
+            hash: t.hash,
+            name: t.name,
+            sizeBytes: t.size || t.total_size || 0,
+            progress: t.progress || 0,
+            dlspeedBps: t.dlspeed || 0,
+            upspeedBps: t.upspeed || 0,
+            etaSeconds: t.eta || 0,
+            state,
+            category: (t.category || "other").toLowerCase() as any,
+            ratio: Number(Number(t.ratio || 0).toFixed(2)),
+            seeds: t.num_seeds || 0,
+            peers: t.num_leechs || 0,
+            savePath: t.save_path || "/downloads",
+          };
+        });
+
+        let stats = mockQbtStats;
+        if (transferResp.ok) {
+          const tf = await transferResp.json();
+          stats = {
+            dlRateBps: tf.dl_info_speed || 0,
+            upRateBps: tf.up_info_speed || 0,
+            dledSessionBytes: tf.dl_info_data || 0,
+            upedSessionBytes: tf.up_info_data || 0,
+            freeSpaceOnDiskBytes: tf.free_space_on_disk || 0,
+            activeCount: torrents.filter((t) => t.state !== "paused").length,
+            pausedCount: torrents.filter((t) => t.state === "paused").length,
+          };
+        }
+
+        return res.json({
+          success: true,
+          data: {
+            torrents,
+            stats,
+          },
+          isLive: true,
+        });
+      }
+    }
+  } catch (err) {
+    console.warn("Live qBittorrent fetch failed, falling back to mock:", err);
+  }
+
   res.json({
     success: true,
     data: {
       torrents: inMemoryTorrents,
       stats: mockQbtStats,
     },
+    isLive: false,
   });
 });
 
-app.post("/api/qbittorrent/torrents/:hash/toggle", (req: Request, res: Response) => {
+app.post("/api/qbittorrent/torrents/:hash/toggle", async (req: Request, res: Response) => {
   const hash = req.params.hash;
+
+  try {
+    const settings = await getAppSettings();
+    if (!settings.demoMode && settings.qbittorrent.enabled && settings.qbittorrent.url) {
+      const cleanUrl = settings.qbittorrent.url.replace(/\/+$/, "");
+      const headers = await getQBittorrentHeaders(settings.qbittorrent);
+
+      const torrentsResp = await safeFetch(`${cleanUrl}/api/v2/torrents/info?hashes=${hash}`, { headers });
+      if (torrentsResp.ok) {
+        const info = await torrentsResp.json();
+        const current = info[0];
+        const isPaused = current && (current.state || "").toLowerCase().includes("pause");
+        const actionEndpoint = isPaused ? "resume" : "pause";
+
+        await safeFetch(`${cleanUrl}/api/v2/torrents/${actionEndpoint}?hashes=${hash}`, {
+          method: "POST",
+          headers,
+        });
+
+        return res.json({ success: true, isLive: true });
+      }
+    }
+  } catch (err) {
+    console.warn("Live qBittorrent toggle failed, falling back to mock:", err);
+  }
+
   const torrent = inMemoryTorrents.find((t) => t.hash === hash);
   if (!torrent) {
     res.status(404).json({ error: "Torrent not found" });
@@ -388,12 +1134,38 @@ app.post("/api/qbittorrent/torrents/:hash/toggle", (req: Request, res: Response)
   }
 
   torrent.state = torrent.state === "downloading" ? "paused" : "downloading";
-  res.json({ success: true, data: torrent });
+  res.json({ success: true, data: torrent, isLive: false });
 });
 
-app.delete("/api/qbittorrent/torrents/:hash", (req: Request, res: Response) => {
+app.delete("/api/qbittorrent/torrents/:hash", async (req: Request, res: Response) => {
   const hash = req.params.hash;
   const deleteData = req.query.deleteData === "true";
+
+  try {
+    const settings = await getAppSettings();
+    if (!settings.demoMode && settings.qbittorrent.enabled && settings.qbittorrent.url) {
+      const cleanUrl = settings.qbittorrent.url.replace(/\/+$/, "");
+      const headers = await getQBittorrentHeaders(settings.qbittorrent);
+
+      const resp = await safeFetch(`${cleanUrl}/api/v2/torrents/delete?hashes=${hash}&deleteFiles=${deleteData}`, {
+        method: "POST",
+        headers,
+      });
+
+      if (resp.ok) {
+        return res.json({
+          success: true,
+          message: deleteData
+            ? "Torrent and downloaded files removed from disk successfully"
+            : "Torrent removed from client (files kept on disk)",
+          deleteData,
+          isLive: true,
+        });
+      }
+    }
+  } catch (err) {
+    console.warn("Live qBittorrent delete failed, falling back to mock:", err);
+  }
 
   inMemoryTorrents = inMemoryTorrents.filter((t) => t.hash !== hash);
 
@@ -403,6 +1175,7 @@ app.delete("/api/qbittorrent/torrents/:hash", (req: Request, res: Response) => {
       ? "Torrent and downloaded files removed from disk successfully"
       : "Torrent removed from client (files kept on disk)",
     deleteData,
+    isLive: false,
   });
 });
 
@@ -415,54 +1188,65 @@ app.post("/api/test-connection", async (req: Request, res: Response) => {
     return;
   }
 
-  // Simulate network latency check or live ping if accessible
   const startTime = Date.now();
   
   try {
-    // If it's a real endpoint attempt ping with short timeout
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
+    const timeout = setTimeout(() => controller.abort(), 4000);
     
-    // We try fetching the health/api endpoint
     let testPath = "/api/v1/status";
-    if (service === "radarr" || service === "sonarr") testPath = "/api/v3/system/status";
-    if (service === "plex") testPath = "/identity";
-    if (service === "qbittorrent") testPath = "/api/v2/app/version";
+    const headers: Record<string, string> = { Accept: "application/json" };
 
-    const pingUrl = url.replace(/\/$/, "") + testPath;
+    if (service === "radarr" || service === "sonarr") {
+      testPath = "/api/v3/system/status";
+      headers["X-Api-Key"] = apiKey || "";
+    } else if (service === "seerr") {
+      testPath = "/api/v1/status";
+      headers["X-Api-Key"] = apiKey || "";
+    } else if (service === "plex") {
+      testPath = "/identity";
+      headers["X-Plex-Token"] = apiKey || "";
+    } else if (service === "qbittorrent") {
+      testPath = "/api/v2/app/version";
+    }
+
+    const pingUrl = url.replace(/\/+$/, "") + testPath;
     
-    await fetch(pingUrl, {
+    const resp = await fetch(pingUrl, {
       signal: controller.signal,
-      headers: {
-        "X-Api-Key": apiKey || "",
-        "X-Plex-Token": apiKey || "",
-      },
-    }).catch(() => null);
+      headers,
+    });
 
     clearTimeout(timeout);
     const latency = Date.now() - startTime;
 
+    if (resp.ok) {
+      res.json({
+        success: true,
+        service,
+        status: "online",
+        latencyMs: latency,
+        message: `Connected successfully to live ${service.toUpperCase()} instance (${resp.status} OK)`,
+      });
+    } else {
+      res.json({
+        success: false,
+        service,
+        status: "degraded",
+        latencyMs: latency,
+        message: `HTTP ${resp.status}: ${resp.statusText} from ${service}`,
+      });
+    }
+  } catch (err: any) {
+    const latency = Date.now() - startTime;
     res.json({
-      success: true,
+      success: false,
       service,
-      status: "online",
-      latencyMs: latency < 10 ? 18 : latency,
-      message: `Connected successfully to ${service} at ${url}`,
-    });
-  } catch (_e) {
-    res.json({
-      success: true,
-      service,
-      status: "online",
-      latencyMs: 25,
-      message: `Verified connection parameters for ${service} (Demo/Simulated)`,
+      status: "offline",
+      latencyMs: latency,
+      message: err.message || `Failed to connect to ${service}`,
     });
   }
-});
-
-// System Status Summary
-app.get("/api/system/health", (_req: Request, res: Response) => {
-  res.json({ success: true, data: initialHealth });
 });
 
 // ------------------- VITE / SERVING -------------------

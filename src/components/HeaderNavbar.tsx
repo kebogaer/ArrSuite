@@ -17,7 +17,7 @@ interface HeaderNavbarProps {
   activeTab: TabType;
   setActiveTab: (tab: TabType) => void;
   serviceHealth: ServiceHealth[];
-  demoMode: boolean;
+  demoMode?: boolean;
   onParseLink: (urlOrText: string) => void;
   isParsingLink: boolean;
 }
@@ -26,7 +26,6 @@ export const HeaderNavbar: React.FC<HeaderNavbarProps> = ({
   activeTab,
   setActiveTab,
   serviceHealth,
-  demoMode,
   onParseLink,
   isParsingLink
 }) => {
@@ -103,11 +102,6 @@ export const HeaderNavbar: React.FC<HeaderNavbarProps> = ({
               <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-white font-sans">
                 ArrSuite <span className="text-blue-500">Central</span>
               </h1>
-              {demoMode && (
-                <span className="text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                  Demo
-                </span>
-              )}
             </div>
             <p className="text-xs text-slate-400 hidden sm:block">
               Unified Media Stack & Request Automation

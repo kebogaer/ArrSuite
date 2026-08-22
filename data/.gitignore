@@ -1,5 +1,0 @@
-# Keep data directory structure tracked in git
-*.sqlite
-*.db
-*.db-wal
-*.db-shm

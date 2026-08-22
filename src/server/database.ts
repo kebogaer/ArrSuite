@@ -267,32 +267,32 @@ export async function getAppSettings(): Promise<ArrSettings> {
   });
 
   return {
-    demoMode: Boolean(obj.demo_mode),
+    demoMode: false,
     seerr: {
-      url: obj.seerr_url || initialSettings.seerr.url,
-      apiKey: obj.seerr_api_key || initialSettings.seerr.apiKey,
-      enabled: Boolean(obj.seerr_enabled),
+      url: obj.seerr_url ?? '',
+      apiKey: obj.seerr_api_key ?? '',
+      enabled: Boolean(obj.seerr_enabled ?? true),
     },
     radarr: {
-      url: obj.radarr_url || initialSettings.radarr.url,
-      apiKey: obj.radarr_api_key || initialSettings.radarr.apiKey,
-      enabled: Boolean(obj.radarr_enabled),
+      url: obj.radarr_url ?? '',
+      apiKey: obj.radarr_api_key ?? '',
+      enabled: Boolean(obj.radarr_enabled ?? true),
     },
     sonarr: {
-      url: obj.sonarr_url || initialSettings.sonarr.url,
-      apiKey: obj.sonarr_api_key || initialSettings.sonarr.apiKey,
-      enabled: Boolean(obj.sonarr_enabled),
+      url: obj.sonarr_url ?? '',
+      apiKey: obj.sonarr_api_key ?? '',
+      enabled: Boolean(obj.sonarr_enabled ?? true),
     },
     plex: {
-      url: obj.plex_url || initialSettings.plex.url,
-      apiKey: obj.plex_api_key || initialSettings.plex.apiKey,
-      enabled: Boolean(obj.plex_enabled),
+      url: obj.plex_url ?? '',
+      apiKey: obj.plex_api_key ?? '',
+      enabled: Boolean(obj.plex_enabled ?? true),
     },
     qbittorrent: {
-      url: obj.qbt_url || initialSettings.qbittorrent.url,
-      username: obj.qbt_username || initialSettings.qbittorrent.username,
-      apiKey: obj.qbt_api_key || initialSettings.qbittorrent.apiKey,
-      enabled: Boolean(obj.qbt_enabled),
+      url: obj.qbt_url ?? '',
+      username: obj.qbt_username ?? '',
+      apiKey: obj.qbt_api_key ?? '',
+      enabled: Boolean(obj.qbt_enabled ?? true),
     },
   };
 }

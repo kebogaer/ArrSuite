@@ -37,13 +37,20 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<TabType>('dashboard');
   const [settings, setSettings] = useState<ArrSettings>(initialSettings);
   const [serviceHealth, setServiceHealth] = useState<ServiceHealth[]>(initialHealth);
-  const [requests, setRequests] = useState<SeerrRequest[]>(mockSeerrRequests);
-  const [movies, setMovies] = useState<RadarrMovie[]>(mockRadarrMovies);
-  const [series, setSeries] = useState<SonarrSeries[]>(mockSonarrSeries);
-  const [sessions, setSessions] = useState<PlexSession[]>(mockPlexSessions);
-  const [recentlyAdded, setRecentlyAdded] = useState<PlexRecentItem[]>(mockPlexRecent);
-  const [torrents, setTorrents] = useState<TorrentItem[]>(mockTorrents);
-  const [qbtStats, setQbtStats] = useState<QBittorrentStats>(mockQbtStats);
+  const [requests, setRequests] = useState<SeerrRequest[]>([]);
+  const [movies, setMovies] = useState<RadarrMovie[]>([]);
+  const [series, setSeries] = useState<SonarrSeries[]>([]);
+  const [sessions, setSessions] = useState<PlexSession[]>([]);
+  const [recentlyAdded, setRecentlyAdded] = useState<PlexRecentItem[]>([]);
+  const [torrents, setTorrents] = useState<TorrentItem[]>([]);
+  const [qbtStats, setQbtStats] = useState<QBittorrentStats>({
+    dlSpeed: 0,
+    upSpeed: 0,
+    activeCount: 0,
+    totalCount: 0,
+    dhtNodes: 0,
+    freeDiskSpaceBytes: 0,
+  });
 
   // Link Parser Modal State
   const [parsedLink, setParsedLink] = useState<ParsedMediaLink | null>(null);
@@ -52,12 +59,36 @@ export default function App() {
   // Initial load from backend API routes
   useEffect(() => {
     fetchSettings();
+    fetchAllData();
+
+    // Periodic polling every 12 seconds for live telemetry
+    const timer = setInterval(() => {
+      fetchPlexStatus();
+      fetchQbittorrent();
+      fetchHealth();
+    }, 12000);
+
+    return () => clearInterval(timer);
+  }, []);
+
+  const fetchAllData = () => {
     fetchSeerrRequests();
     fetchRadarrMovies();
     fetchSonarrSeries();
     fetchPlexStatus();
     fetchQbittorrent();
-  }, []);
+    fetchHealth();
+  };
+
+  const fetchHealth = async () => {
+    try {
+      const res = await fetch('/api/health');
+      const data = await res.json();
+      if (data.data && Array.isArray(data.data)) {
+        setServiceHealth(data.data);
+      }
+    } catch (_e) {}
+  };
 
   const fetchSettings = async () => {
     try {
@@ -77,6 +108,8 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newSettings),
       });
+      // Immediately reload all data from newly saved endpoints / mode
+      setTimeout(() => fetchAllData(), 300);
     } catch (e) {
       console.error('Failed to persist settings to SQLite', e);
     }

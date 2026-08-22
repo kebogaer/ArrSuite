@@ -14,8 +14,6 @@ import {
   Tv,
   Clapperboard,
   Download,
-  ToggleLeft,
-  ToggleRight,
   Info,
   Database
 } from 'lucide-react';
@@ -90,23 +88,13 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
           </div>
         </div>
 
-        {/* Demo Mode Toggle */}
-        <div className="flex items-center gap-3 bg-slate-950 px-4 py-2.5 rounded-xl border border-slate-800">
-          <span className="text-xs text-slate-300 font-medium">Demo Mode</span>
+        <div className="flex items-center gap-2">
           <button
-            type="button"
-            onClick={() => {
-              const updated = { ...localSettings, demoMode: !localSettings.demoMode };
-              setLocalSettings(updated);
-              onUpdateSettings(updated);
-            }}
-            className="text-sky-400 focus:outline-none"
+            onClick={handleSave}
+            className="px-5 py-2.5 bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 text-white text-xs font-bold rounded-xl shadow-lg shadow-sky-500/20 transition-all flex items-center gap-2"
           >
-            {localSettings.demoMode ? (
-              <ToggleRight className="w-8 h-8 text-sky-400" />
-            ) : (
-              <ToggleLeft className="w-8 h-8 text-slate-600" />
-            )}
+            <CheckCircle className="w-4 h-4" />
+            <span>Save Settings</span>
           </button>
         </div>
       </div>
