@@ -37,14 +37,7 @@ export default function App() {
   const [sessions, setSessions] = useState<PlexSession[]>([]);
   const [recentlyAdded, setRecentlyAdded] = useState<PlexRecentItem[]>([]);
   const [torrents, setTorrents] = useState<TorrentItem[]>([]);
-  const [qbtStats, setQbtStats] = useState<QBittorrentStats>({
-    dlSpeed: 0,
-    upSpeed: 0,
-    activeCount: 0,
-    totalCount: 0,
-    dhtNodes: 0,
-    freeDiskSpaceBytes: 0,
-  });
+  const [qbtStats, setQbtStats] = useState<QBittorrentStats>(emptyQbtStats);
 
   // Link Parser Modal State
   const [parsedLink, setParsedLink] = useState<ParsedMediaLink | null>(null);
