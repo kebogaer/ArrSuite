@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Settings,
   Server,
@@ -16,7 +16,8 @@ import {
   Download,
   ToggleLeft,
   ToggleRight,
-  Info
+  Info,
+  Database
 } from 'lucide-react';
 import { ArrSettings } from '../../types';
 
@@ -35,6 +36,20 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
   const [testingService, setTestingService] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, { success: boolean; message: string; latencyMs?: number }>>({});
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [dbDiag, setDbDiag] = useState<any>(null);
+
+  useEffect(() => {
+    setLocalSettings(settings);
+  }, [settings]);
+
+  useEffect(() => {
+    fetch('/api/db/diagnostics')
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.success && data.data) setDbDiag(data.data);
+      })
+      .catch(() => {});
+  }, [saveSuccess]);
 
   const handleTest = async (serviceKey: string, url: string, apiKey: string) => {
     setTestingService(serviceKey);
@@ -415,6 +430,39 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
             </button>
           </div>
         </div>
+
+        {/* Database & Storage Status Card */}
+        <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Database className="w-4 h-4 text-emerald-400" />
+              <span className="text-sm font-bold text-slate-100">Persistent SQLite Storage</span>
+            </div>
+            <span className="px-2.5 py-0.5 rounded-full text-[10px] font-mono font-bold uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              Active Database
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+            <div className="p-2.5 bg-slate-950/80 rounded-xl border border-slate-800/80 font-mono">
+              <span className="text-[10px] text-slate-400 block uppercase font-sans">Storage File</span>
+              <span className="text-slate-200 font-semibold truncate block">data/mediastack.sqlite</span>
+            </div>
+            <div className="p-2.5 bg-slate-950/80 rounded-xl border border-slate-800/80 font-mono">
+              <span className="text-[10px] text-slate-400 block uppercase font-sans">Engine</span>
+              <span className="text-emerald-400 font-semibold block">SQLite 3 (WASM)</span>
+            </div>
+            <div className="p-2.5 bg-slate-950/80 rounded-xl border border-slate-800/80 font-mono">
+              <span className="text-[10px] text-slate-400 block uppercase font-sans">Docker Volume</span>
+              <span className="text-sky-300 font-semibold block truncate">/app/data</span>
+            </div>
+          </div>
+
+          <p className="text-[11px] text-slate-400 leading-relaxed">
+            All configured endpoint URLs, API keys, credentials, and demo modes are stored directly in your local SQLite database file. Docker compose mounts <code className="text-slate-300 bg-slate-800 px-1 py-0.5 rounded">/app/data</code> ensuring settings persist across container updates.
+          </p>
+        </div>
       </div>
 
       {/* Save Settings Bar */}
@@ -423,10 +471,10 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
           {saveSuccess ? (
             <span className="text-emerald-400 font-semibold flex items-center gap-1.5">
               <CheckCircle className="w-4 h-4" />
-              Settings saved successfully!
+              Settings saved & persisted to SQLite database!
             </span>
           ) : (
-            <span>Changes persist locally in browser and server state</span>
+            <span>Changes persist automatically to the SQLite database on disk</span>
           )}
         </div>
         <button

@@ -15,6 +15,11 @@ import {
   sampleParsedLinks,
 } from "./src/data/mockData";
 import { ParsedMediaLink, SeerrRequest } from "./src/types";
+import {
+  getAppSettings,
+  saveAppSettings,
+  getDatabaseDiagnostics,
+} from "./src/server/database";
 
 const app = express();
 const PORT = 3000;
@@ -57,6 +62,39 @@ function getGeminiClient() {
 }
 
 // ------------------- API ROUTES -------------------
+
+// 0. Settings & Database Persistence (SQLite)
+app.get("/api/settings", async (_req: Request, res: Response) => {
+  try {
+    const settings = await getAppSettings();
+    res.json({ success: true, data: settings });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to load settings from SQLite" });
+  }
+});
+
+app.post("/api/settings", async (req: Request, res: Response) => {
+  try {
+    const newSettings = req.body;
+    const saved = await saveAppSettings(newSettings);
+    res.json({
+      success: true,
+      message: "Settings saved to SQLite database successfully",
+      data: saved,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to save settings to SQLite" });
+  }
+});
+
+app.get("/api/db/diagnostics", async (_req: Request, res: Response) => {
+  try {
+    const diag = await getDatabaseDiagnostics();
+    res.json({ success: true, data: diag });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to get database diagnostics" });
+  }
+});
 
 // 1. Health check
 app.get("/api/health", (_req: Request, res: Response) => {

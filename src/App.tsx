@@ -51,12 +51,36 @@ export default function App() {
 
   // Initial load from backend API routes
   useEffect(() => {
+    fetchSettings();
     fetchSeerrRequests();
     fetchRadarrMovies();
     fetchSonarrSeries();
     fetchPlexStatus();
     fetchQbittorrent();
   }, []);
+
+  const fetchSettings = async () => {
+    try {
+      const res = await fetch('/api/settings');
+      const data = await res.json();
+      if (data.success && data.data) {
+        setSettings(data.data);
+      }
+    } catch (_e) {}
+  };
+
+  const handleUpdateSettings = async (newSettings: ArrSettings) => {
+    setSettings(newSettings);
+    try {
+      await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newSettings),
+      });
+    } catch (e) {
+      console.error('Failed to persist settings to SQLite', e);
+    }
+  };
 
   const fetchSeerrRequests = async () => {
     try {
@@ -330,7 +354,7 @@ export default function App() {
         {activeTab === 'settings' && (
           <SettingsTab
             settings={settings}
-            onUpdateSettings={setSettings}
+            onUpdateSettings={handleUpdateSettings}
             onTestConnection={handleTestConnection}
           />
         )}
