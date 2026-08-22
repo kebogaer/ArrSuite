@@ -5,7 +5,7 @@ WORKDIR /app
 
 COPY package*.json ./
 
-RUN npm install
+RUN npm ci
 
 COPY . .
 
@@ -25,6 +25,8 @@ COPY --from=builder /app/package*.json ./
 RUN npm install --omit=dev
 
 COPY --from=builder /app/dist ./dist
+
+RUN mkdir -p /app/data
 
 EXPOSE 3000
 
