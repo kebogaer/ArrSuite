@@ -20,7 +20,6 @@ import {
   Tv2
 } from 'lucide-react';
 import { DiscoverMediaItem, ParsedMediaLink, SeerrRequest } from '../../types';
-import { mockPopularMedia } from '../../data/mockData';
 
 interface SeerrTabProps {
   requests: SeerrRequest[];
@@ -44,7 +43,7 @@ export const SeerrTab: React.FC<SeerrTabProps> = ({
   const [cardLayout, setCardLayout] = useState<'banner' | 'grid'>('banner');
 
   // Discover State
-  const [popularItems, setPopularItems] = useState<DiscoverMediaItem[]>(mockPopularMedia);
+  const [popularItems, setPopularItems] = useState<DiscoverMediaItem[]>([]);
   const [discoverType, setDiscoverType] = useState<'all' | 'movie' | 'tv'>('all');
   const [selectedGenre, setSelectedGenre] = useState<string>('all');
   const [discoverSearch, setDiscoverSearch] = useState<string>('');
@@ -389,7 +388,17 @@ export const SeerrTab: React.FC<SeerrTabProps> = ({
           </div>
 
           {/* Popular Media Items Container */}
-          {cardLayout === 'banner' ? (
+          {filteredPopularItems.length === 0 ? (
+            <div className="py-16 px-6 text-center rounded-2xl bg-slate-900/60 border border-slate-800 flex flex-col items-center justify-center space-y-3">
+              <div className="p-3 bg-purple-500/10 rounded-2xl border border-purple-500/20 text-purple-400">
+                <Sparkles className="w-8 h-8" />
+              </div>
+              <h3 className="text-base font-bold text-slate-200">No media discovery loaded</h3>
+              <p className="text-xs text-slate-400 max-w-md leading-relaxed">
+                Connect your Overseerr / Jellyseerr URL and API key in Settings to stream live trending recommendations, or use the quick request search above to submit a movie or TV show.
+              </p>
+            </div>
+          ) : cardLayout === 'banner' ? (
             /* Compact Horizontal Banners Layout */
             <div className="space-y-3">
               {filteredPopularItems.map((item) => {

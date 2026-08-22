@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Film,
   Tv,
@@ -22,6 +22,7 @@ import {
   User
 } from 'lucide-react';
 import {
+  DiscoverMediaItem,
   PlexSession,
   QBittorrentStats,
   RadarrMovie,
@@ -31,7 +32,6 @@ import {
   TabType,
   TorrentItem
 } from '../../types';
-import { mockPopularMedia } from '../../data/mockData';
 
 interface DashboardTabProps {
   requests: SeerrRequest[];
@@ -58,6 +58,19 @@ export const DashboardTab: React.FC<DashboardTabProps> = ({
   onParseLink,
   onApproveRequest,
 }) => {
+  const [trendingItems, setTrendingItems] = useState<DiscoverMediaItem[]>([]);
+
+  useEffect(() => {
+    fetch('/api/seerr/discover')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.success && Array.isArray(data.data)) {
+          setTrendingItems(data.data);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
   const totalEpisodes = series.reduce((acc, s) => acc + s.episodeCount, 0);
   const downloadedEpisodes = series.reduce((acc, s) => acc + s.episodeFileCount, 0);
   const totalMovies = movies.length;
@@ -235,51 +248,62 @@ export const DashboardTab: React.FC<DashboardTabProps> = ({
               </button>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-              {mockPopularMedia.slice(0, 4).map((item) => (
-                <div 
-                  key={item.id} 
-                  className="bg-slate-950/60 border border-slate-800/70 rounded-xl p-2 flex flex-col justify-between hover:border-purple-500/40 transition-all group relative"
-                >
-                  <div className="aspect-[2/3] w-full rounded-lg overflow-hidden bg-slate-800 relative mb-2">
-                    <img 
-                      src={item.posterUrl} 
-                      alt={item.title} 
-                      className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                    />
-                    <div className="absolute top-1.5 left-1.5 bg-slate-950/80 backdrop-blur-md px-1.5 py-0.5 rounded text-[10px] font-bold text-slate-200 border border-slate-800 uppercase">
-                      {item.type === 'movie' ? 'Movie' : 'TV'}
-                    </div>
-                    <div className="absolute bottom-1.5 right-1.5 bg-slate-950/80 backdrop-blur-md px-1.5 py-0.5 rounded text-[10px] font-bold text-amber-400 border border-slate-800 flex items-center gap-0.5">
-                      <Star className="w-2.5 h-2.5 fill-amber-400 text-amber-400" />
-                      {item.rating}
-                    </div>
-                  </div>
-
-                  <div>
-                    <h4 className="text-xs font-bold text-slate-100 truncate group-hover:text-purple-300 transition-colors">
-                      {item.title}
-                    </h4>
-                    <p className="text-[10px] text-slate-400 truncate">
-                      {item.year} • {item.genres[0]}
-                    </p>
-                  </div>
-
-                  <button
-                    onClick={() => onParseLink(item.imdbId || item.title)}
-                    className="mt-2 w-full py-1.5 px-2 bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 border border-purple-500/30 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1 transition-colors"
+            {trendingItems.length > 0 ? (
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                {trendingItems.slice(0, 4).map((item) => (
+                  <div 
+                    key={item.id} 
+                    className="bg-slate-950/60 border border-slate-800/70 rounded-xl p-2 flex flex-col justify-between hover:border-purple-500/40 transition-all group relative"
                   >
-                    <Plus className="w-3 h-3" />
-                    Request Item
-                  </button>
-                </div>
-              ))}
-            </div>
+                    <div className="aspect-[2/3] w-full rounded-lg overflow-hidden bg-slate-800 relative mb-2">
+                      <img 
+                        src={item.posterUrl} 
+                        alt={item.title} 
+                        className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                        referrerPolicy="no-referrer"
+                      />
+                      <div className="absolute top-1.5 left-1.5 bg-slate-950/80 backdrop-blur-md px-1.5 py-0.5 rounded text-[10px] font-bold text-slate-200 border border-slate-800 uppercase">
+                        {item.type === 'movie' ? 'Movie' : 'TV'}
+                      </div>
+                      <div className="absolute bottom-1.5 right-1.5 bg-slate-950/80 backdrop-blur-md px-1.5 py-0.5 rounded text-[10px] font-bold text-amber-400 border border-slate-800 flex items-center gap-0.5">
+                        <Star className="w-2.5 h-2.5 fill-amber-400 text-amber-400" />
+                        {item.rating}
+                      </div>
+                    </div>
+
+                    <div>
+                      <h4 className="text-xs font-bold text-slate-100 truncate group-hover:text-purple-300 transition-colors">
+                        {item.title}
+                      </h4>
+                      <p className="text-[10px] text-slate-400 truncate">
+                        {item.year} {item.genres && item.genres.length > 0 ? `• ${item.genres[0]}` : ''}
+                      </p>
+                    </div>
+
+                    <button
+                      onClick={() => onParseLink(item.imdbId || item.title)}
+                      className="mt-2 w-full py-1.5 px-2 bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 border border-purple-500/30 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1 transition-colors cursor-pointer"
+                    >
+                      <Plus className="w-3 h-3" />
+                      Request Item
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="py-8 px-4 text-center rounded-xl bg-slate-950/40 border border-slate-800/60 flex flex-col items-center justify-center space-y-2">
+                <Sparkles className="w-6 h-6 text-slate-600" />
+                <p className="text-xs text-slate-300 font-medium">No trending releases loaded yet</p>
+                <p className="text-[11px] text-slate-500 max-w-sm">
+                  Configure your Overseerr / Jellyseerr URL and API Key in Settings to populate live trending releases, or parse an IMDb link above to submit a new request.
+                </p>
+              </div>
+            )}
           </div>
 
           <div className="mt-4 pt-3 border-t border-slate-800/60 flex items-center justify-between text-xs text-slate-400">
-            <span>Powered by TMDB & Seerr API</span>
-            <span className="text-xs text-slate-400 font-mono">Updated today</span>
+            <span>Powered by Live Overseerr / Jellyseerr API</span>
+            <span className="text-xs text-slate-400 font-mono">{trendingItems.length} Live Items</span>
           </div>
         </div>
 

@@ -3,7 +3,7 @@ import crypto from 'crypto';
 import path from 'path';
 import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
 import { ArrSettings } from '../types';
-import { initialSettings } from '../data/mockData';
+import { initialSettings } from '../data/defaults';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DB_PATH = path.join(DATA_DIR, 'mediastack.sqlite');

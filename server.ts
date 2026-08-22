@@ -1,21 +1,17 @@
 import { GoogleGenAI, Type } from "@google/genai";
-import express, { Request, Response } from "express";
+import express, { NextFunction, Request, Response } from "express";
+import cookieParser from "cookie-parser";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import {
+  emptyPlexStats,
+  emptyQbtStats,
   initialHealth,
-  mockPlexRecent,
-  mockPlexSessions,
-  mockPopularMedia,
-  mockQbtStats,
-  mockRadarrMovies,
-  mockSeerrRequests,
-  mockSonarrSeries,
-  mockTorrents,
-  sampleParsedLinks,
-} from "./src/data/mockData";
+  initialSettings,
+} from "./src/data/defaults";
 import {
   ArrSettings,
+  DiscoverMediaItem,
   ParsedMediaLink,
   PlexRecentItem,
   PlexSession,
@@ -30,33 +26,182 @@ import {
   getAppSettings,
   saveAppSettings,
   getDatabaseDiagnostics,
+  hasAdminUser,
+  setupInitialAdmin,
+  loginUser,
+  validateSession,
+  logoutSession,
 } from "./src/server/database";
 
 const app = express();
 const PORT = 3000;
 
+app.set("trust proxy", 1);
 app.use(express.json());
+app.use(cookieParser());
 
-// Enable CORS middleware for Nginx reverse proxy compatibility
-app.use((req: Request, res: Response, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+const isProd = process.env.NODE_ENV === "production";
+const SESSION_COOKIE_NAME = "mediastack_session";
+const COOKIE_OPTIONS = {
+  httpOnly: true,
+  sameSite: "lax" as const,
+  secure: isProd,
+  maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+};
+
+// Strict fail-closed CORS middleware with credentials support
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const origin = req.headers.origin;
+  const appUrl = process.env.APP_URL;
+
+  let isAllowed = false;
+  let allowedOrigin = "";
+
+  if (appUrl && origin) {
+    // Exact origin match when APP_URL is configured
+    if (origin === appUrl || origin === appUrl.replace(/\/$/, "")) {
+      isAllowed = true;
+      allowedOrigin = origin;
+    }
+  } else if (!isProd && origin) {
+    // In local development, permit request origin for localhost / dev previews
+    isAllowed = true;
+    allowedOrigin = origin;
+  }
+
+  if (isAllowed && allowedOrigin) {
+    res.header("Access-Control-Allow-Origin", allowedOrigin);
+    res.header("Access-Control-Allow-Credentials", "true");
+  }
+
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
   res.header(
     "Access-Control-Allow-Headers",
     "Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Api-Key"
   );
+
   if (req.method === "OPTIONS") {
-    res.sendStatus(200);
+    if (origin && !isAllowed) {
+      res.status(403).json({ error: "CORS origin forbidden" });
+      return;
+    }
+    res.sendStatus(204);
     return;
   }
   next();
 });
 
-// Memory store for demo requests added during session
-let inMemoryRequests: SeerrRequest[] = [...mockSeerrRequests];
-let inMemoryRadarrMovies = [...mockRadarrMovies];
-let inMemorySonarrSeries = [...mockSonarrSeries];
-let inMemoryTorrents = [...mockTorrents];
+// ------------------- AUTHENTICATION ROUTES -------------------
+
+// GET /api/auth/status
+app.get("/api/auth/status", async (req: Request, res: Response) => {
+  try {
+    const hasAdmin = await hasAdminUser();
+    const token = req.cookies[SESSION_COOKIE_NAME];
+    const sessionRes = await validateSession(token);
+
+    res.json({
+      success: true,
+      needsSetup: !hasAdmin,
+      authenticated: sessionRes.valid,
+      user: sessionRes.user || null,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to check auth status" });
+  }
+});
+
+// POST /api/auth/setup
+app.post("/api/auth/setup", async (req: Request, res: Response) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      res.status(400).json({ error: "Username and password are required" });
+      return;
+    }
+
+    const result = await setupInitialAdmin(username, password);
+    if (!result.success || !result.token) {
+      res.status(400).json({ error: result.error || "Failed to set up admin user" });
+      return;
+    }
+
+    res.cookie(SESSION_COOKIE_NAME, result.token, COOKIE_OPTIONS);
+    res.json({
+      success: true,
+      message: "Admin account configured successfully",
+      user: { username: username.trim(), role: "admin" },
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Setup failed" });
+  }
+});
+
+// POST /api/auth/login
+app.post("/api/auth/login", async (req: Request, res: Response) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      res.status(400).json({ error: "Username and password are required" });
+      return;
+    }
+
+    const result = await loginUser(username, password);
+    if (!result.success || !result.token) {
+      res.status(401).json({ error: result.error || "Invalid username or password" });
+      return;
+    }
+
+    res.cookie(SESSION_COOKIE_NAME, result.token, COOKIE_OPTIONS);
+    res.json({
+      success: true,
+      message: "Logged in successfully",
+      user: { username: username.trim(), role: "admin" },
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Login failed" });
+  }
+});
+
+// POST /api/auth/logout
+app.post("/api/auth/logout", async (req: Request, res: Response) => {
+  try {
+    const token = req.cookies[SESSION_COOKIE_NAME];
+    if (token) {
+      await logoutSession(token);
+    }
+    res.clearCookie(SESSION_COOKIE_NAME, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: isProd,
+    });
+    res.json({ success: true, message: "Logged out successfully" });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Logout failed" });
+  }
+});
+
+// Auth Guard Middleware: Gates all other /api/* routes except /api/health and /api/auth/*
+app.use("/api", async (req: Request, res: Response, next: NextFunction) => {
+  // Allow health endpoint to remain publicly accessible for status checks
+  if (req.path === "/health" || req.path.startsWith("/auth/")) {
+    return next();
+  }
+
+  const token = req.cookies[SESSION_COOKIE_NAME];
+  const validation = await validateSession(token);
+
+  if (!validation.valid) {
+    res.status(401).json({
+      error: "Unauthorized: Valid session cookie required",
+      authenticated: false,
+    });
+    return;
+  }
+
+  (req as any).user = validation.user;
+  next();
+});
 
 // Initialize Gemini AI Client lazily if key exists
 function getGeminiClient() {
@@ -178,13 +323,6 @@ async function getQBittorrentHeaders(qbtConfig: any): Promise<Record<string, str
 app.get("/api/health", async (_req: Request, res: Response) => {
   try {
     const settings = await getAppSettings();
-    if (settings.demoMode) {
-      return res.json({
-        status: "ok",
-        demoMode: true,
-        data: initialHealth,
-      });
-    }
 
     const checkService = async (
       id: string,
@@ -199,8 +337,8 @@ app.get("/api/health", async (_req: Request, res: Response) => {
           type,
           status: "offline",
           latencyMs: 0,
-          url: cfg.url || "Disabled",
-          message: "Service disabled in settings",
+          url: cfg.url || "Not configured",
+          message: "Service not configured or disabled in settings",
         };
       }
 
@@ -271,7 +409,7 @@ app.get("/api/health", async (_req: Request, res: Response) => {
     };
 
     const healthResults = await Promise.all([
-      checkService("seerr", "Seerr", "seerr", settings.seerr),
+      checkService("seerr", "Overseerr / Jellyseerr", "seerr", settings.seerr),
       checkService("radarr", "Radarr", "radarr", settings.radarr),
       checkService("sonarr", "Sonarr", "sonarr", settings.sonarr),
       checkService("plex", "Plex Media Server", "plex", settings.plex),
@@ -280,11 +418,10 @@ app.get("/api/health", async (_req: Request, res: Response) => {
 
     res.json({
       status: "ok",
-      demoMode: false,
       data: healthResults,
     });
-  } catch (err: any) {
-    res.json({ status: "ok", demoMode: true, data: initialHealth });
+  } catch (_err: any) {
+    res.json({ status: "ok", data: initialHealth });
   }
 });
 
@@ -302,11 +439,6 @@ app.post("/api/parse-link", async (req: Request, res: Response) => {
     // Check for IMDb ID match in string (e.g. tt15239678)
     const imdbMatch = trimmed.match(/tt\d{7,10}/i);
     const imdbId = imdbMatch ? imdbMatch[0].toLowerCase() : null;
-
-    if (imdbId && sampleParsedLinks[imdbId]) {
-      res.json({ success: true, data: sampleParsedLinks[imdbId], source: "prebuilt" });
-      return;
-    }
 
     // Attempt Gemini AI Parsing if GEMINI_API_KEY is available
     const ai = getGeminiClient();
@@ -373,7 +505,7 @@ If it is an IMDb or TMDB URL, extract title, year, media type ("movie" or "tv"),
       .trim() || "Shared Media Title";
 
     const fallbackResult: ParsedMediaLink = {
-      title: cleanTitle.length > 0 ? cleanTitle : "Shared IMDb Media",
+      title: cleanTitle.length > 0 ? cleanTitle : "Shared Media",
       year: 2024,
       type: isTv ? "tv" : "movie",
       imdbId: imdbId || `tt${Math.floor(1000000 + Math.random() * 9000000)}`,
@@ -394,14 +526,59 @@ If it is an IMDb or TMDB URL, extract title, year, media type ("movie" or "tv"),
 });
 
 // 3. Seerr Requests Proxy / Handler
-app.get("/api/seerr/discover", (_req: Request, res: Response) => {
-  res.json({ success: true, data: mockPopularMedia });
+app.get("/api/seerr/discover", async (_req: Request, res: Response) => {
+  try {
+    const settings = await getAppSettings();
+    if (settings.seerr.enabled && settings.seerr.url && settings.seerr.apiKey) {
+      const cleanUrl = settings.seerr.url.replace(/\/+$/, "");
+      const resp = await safeFetch(`${cleanUrl}/api/v1/discover/trending`, {
+        headers: {
+          "X-Api-Key": settings.seerr.apiKey,
+          Accept: "application/json",
+        },
+      });
+
+      if (resp.ok) {
+        const raw = await resp.json();
+        const results = raw.results || (Array.isArray(raw) ? raw : []);
+        const mapped: DiscoverMediaItem[] = results.map((item: any, idx: number) => {
+          const isTv = item.mediaType === "tv" || item.type === "tv";
+          const posterPath = item.posterPath || item.poster_path;
+          const backdropPath = item.backdropPath || item.backdrop_path;
+          return {
+            id: item.id,
+            tmdbId: item.id,
+            title: item.title || item.name || "Media Title",
+            year: String(item.releaseDate || item.firstAirDate || "2024").slice(0, 4),
+            type: isTv ? "tv" : "movie",
+            posterUrl: posterPath
+              ? (posterPath.startsWith("http") ? posterPath : `https://image.tmdb.org/t/p/w500${posterPath}`)
+              : "https://images.unsplash.com/photo-1534447677768-be436bb09401?w=500&auto=format&fit=crop",
+            backdropUrl: backdropPath
+              ? (backdropPath.startsWith("http") ? backdropPath : `https://image.tmdb.org/t/p/original${backdropPath}`)
+              : undefined,
+            overview: item.overview || "",
+            rating: Number(Number(item.voteAverage || item.vote_average || 8.0).toFixed(1)),
+            genres: [],
+            trendingRank: idx + 1,
+            status: item.mediaInfo ? (item.mediaInfo.status === 5 ? "available" : item.mediaInfo.status === 4 ? "processing" : item.mediaInfo.status === 2 ? "approved" : item.mediaInfo.status === 3 ? "declined" : "requested") : "not_requested",
+          };
+        });
+
+        return res.json({ success: true, data: mapped, isLive: true });
+      }
+    }
+  } catch (err) {
+    console.warn("Live Seerr discover failed:", err);
+  }
+
+  res.json({ success: true, data: [], isLive: false });
 });
 
 app.get("/api/seerr/requests", async (_req: Request, res: Response) => {
   try {
     const settings = await getAppSettings();
-    if (!settings.demoMode && settings.seerr.enabled && settings.seerr.url && settings.seerr.apiKey) {
+    if (settings.seerr.enabled && settings.seerr.url && settings.seerr.apiKey) {
       const cleanUrl = settings.seerr.url.replace(/\/+$/, "");
       const response = await safeFetch(`${cleanUrl}/api/v1/request?take=50&filter=all&sort=added`, {
         headers: {
@@ -464,10 +641,10 @@ app.get("/api/seerr/requests", async (_req: Request, res: Response) => {
       }
     }
   } catch (err) {
-    console.warn("Live Seerr fetch failed, falling back to mock:", err);
+    console.warn("Live Seerr fetch failed:", err);
   }
 
-  res.json({ success: true, data: inMemoryRequests, isLive: false });
+  res.json({ success: true, data: [], isLive: false });
 });
 
 app.post("/api/seerr/request", async (req: Request, res: Response) => {
@@ -480,7 +657,7 @@ app.post("/api/seerr/request", async (req: Request, res: Response) => {
 
   try {
     const settings = await getAppSettings();
-    if (!settings.demoMode && settings.seerr.enabled && settings.seerr.url && settings.seerr.apiKey) {
+    if (settings.seerr.enabled && settings.seerr.url && settings.seerr.apiKey) {
       const cleanUrl = settings.seerr.url.replace(/\/+$/, "");
       const isTv = media.type === "tv" || media.mediaType === "tv";
 
@@ -511,42 +688,20 @@ app.post("/api/seerr/request", async (req: Request, res: Response) => {
           data: created,
           isLive: true,
         });
+      } else {
+        const errBody = await response.text();
+        return res.status(response.status).json({
+          error: `Overseerr returned HTTP ${response.status}: ${errBody}`,
+        });
       }
     }
   } catch (err: any) {
-    console.warn("Live Seerr request failed, falling back to in-memory:", err);
+    console.warn("Live Seerr request failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to submit request to Overseerr" });
   }
 
-  const newRequest: SeerrRequest = {
-    id: Date.now(),
-    status: "APPROVED",
-    media: {
-      tmdbId: media.tmdbId || Math.floor(100000 + Math.random() * 900000),
-      imdbId: media.imdbId,
-      mediaType: media.type === "tv" ? "tv" : "movie",
-      title: media.title,
-      posterPath: media.posterUrl || "https://images.unsplash.com/photo-1534447677768-be436bb09401?w=500&auto=format&fit=crop",
-      releaseDate: `${media.year || 2024}-01-01`,
-      overview: media.overview || "Requested via ArrSuite Hub shared link.",
-      voteAverage: media.rating || 8.0,
-    },
-    requestedBy: {
-      id: 1,
-      username: "Kevin (Admin)",
-    },
-    createdAt: new Date().toISOString(),
-    is4k: !!is4k,
-    seasonsRequested: media.type === "tv" ? seasonsRequested || [1] : undefined,
-    serverStatus: "Auto-Approved • Waiting to be filled",
-  };
-
-  inMemoryRequests.unshift(newRequest);
-
-  res.json({
-    success: true,
-    message: "Request successfully routed through Seerr!",
-    data: newRequest,
-    isLive: false,
+  res.status(400).json({
+    error: "Overseerr / Jellyseerr URL and API Key must be configured in Settings to submit requests.",
   });
 });
 
@@ -557,7 +712,7 @@ app.patch("/api/seerr/requests/:id", async (req: Request, res: Response) => {
 
   try {
     const settings = await getAppSettings();
-    if (!settings.demoMode && settings.seerr.enabled && settings.seerr.url && settings.seerr.apiKey) {
+    if (settings.seerr.enabled && settings.seerr.url && settings.seerr.apiKey) {
       const cleanUrl = settings.seerr.url.replace(/\/+$/, "");
       const action = status === "APPROVED" ? "approve" : (status === "DECLINED" ? "decline" : null);
 
@@ -570,37 +725,24 @@ app.patch("/api/seerr/requests/:id", async (req: Request, res: Response) => {
         if (response.ok) {
           const data = await response.json();
           return res.json({ success: true, data, isLive: true });
+        } else {
+          return res.status(response.status).json({ error: `Failed to ${action} request in Overseerr` });
         }
       }
     }
-  } catch (err) {
-    console.warn("Live Seerr status patch failed, falling back to mock:", err);
+  } catch (err: any) {
+    console.warn("Live Seerr status patch failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to update request status in Overseerr" });
   }
 
-  const request = inMemoryRequests.find((r) => r.id === reqId);
-  if (!request) {
-    res.status(404).json({ error: "Request not found" });
-    return;
-  }
-
-  request.status = status;
-  if (status === "APPROVED") {
-    request.serverStatus =
-      request.media.mediaType === "movie"
-        ? "Seerr approved -> Sent to Radarr (HD/4K Profile)"
-        : "Seerr approved -> Sent to Sonarr (Monitoring S01)";
-  } else if (status === "DECLINED") {
-    request.serverStatus = "Request declined by Administrator";
-  }
-
-  res.json({ success: true, data: request, isLive: false });
+  res.status(400).json({ error: "Overseerr instance not connected" });
 });
 
 // 4. Radarr Movies Proxy
 app.get("/api/radarr/movies", async (_req: Request, res: Response) => {
   try {
     const settings = await getAppSettings();
-    if (!settings.demoMode && settings.radarr.enabled && settings.radarr.url && settings.radarr.apiKey) {
+    if (settings.radarr.enabled && settings.radarr.url && settings.radarr.apiKey) {
       const cleanUrl = settings.radarr.url.replace(/\/+$/, "");
       const response = await safeFetch(`${cleanUrl}/api/v3/movie`, {
         headers: {
@@ -654,10 +796,10 @@ app.get("/api/radarr/movies", async (_req: Request, res: Response) => {
       }
     }
   } catch (err) {
-    console.warn("Live Radarr fetch failed, falling back to mock:", err);
+    console.warn("Live Radarr fetch failed:", err);
   }
 
-  res.json({ success: true, data: inMemoryRadarrMovies, isLive: false });
+  res.json({ success: true, data: [], isLive: false });
 });
 
 app.patch("/api/radarr/movies/:id", async (req: Request, res: Response) => {
@@ -666,7 +808,7 @@ app.patch("/api/radarr/movies/:id", async (req: Request, res: Response) => {
 
   try {
     const settings = await getAppSettings();
-    if (!settings.demoMode && settings.radarr.enabled && settings.radarr.url && settings.radarr.apiKey) {
+    if (settings.radarr.enabled && settings.radarr.url && settings.radarr.apiKey) {
       const cleanUrl = settings.radarr.url.replace(/\/+$/, "");
       const getResp = await safeFetch(`${cleanUrl}/api/v3/movie/${id}`, {
         headers: { "X-Api-Key": settings.radarr.apiKey },
@@ -691,20 +833,12 @@ app.patch("/api/radarr/movies/:id", async (req: Request, res: Response) => {
         }
       }
     }
-  } catch (err) {
-    console.warn("Live Radarr patch failed, falling back to mock:", err);
+  } catch (err: any) {
+    console.warn("Live Radarr patch failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to update movie in Radarr" });
   }
 
-  const movie = inMemoryRadarrMovies.find((m) => m.id === id);
-  if (!movie) {
-    res.status(404).json({ error: "Movie not found" });
-    return;
-  }
-
-  if (qualityProfile !== undefined) movie.qualityProfile = qualityProfile;
-  if (monitored !== undefined) movie.monitored = monitored;
-
-  res.json({ success: true, data: movie, isLive: false });
+  res.status(400).json({ error: "Radarr instance not connected" });
 });
 
 app.delete("/api/radarr/movies/:id", async (req: Request, res: Response) => {
@@ -713,7 +847,7 @@ app.delete("/api/radarr/movies/:id", async (req: Request, res: Response) => {
 
   try {
     const settings = await getAppSettings();
-    if (!settings.demoMode && settings.radarr.enabled && settings.radarr.url && settings.radarr.apiKey) {
+    if (settings.radarr.enabled && settings.radarr.url && settings.radarr.apiKey) {
       const cleanUrl = settings.radarr.url.replace(/\/+$/, "");
       const deleteResp = await safeFetch(
         `${cleanUrl}/api/v3/movie/${id}?deleteFiles=${deleteFiles}&addImportExclusion=false`,
@@ -733,25 +867,19 @@ app.delete("/api/radarr/movies/:id", async (req: Request, res: Response) => {
         });
       }
     }
-  } catch (err) {
-    console.warn("Live Radarr delete failed, falling back to mock:", err);
+  } catch (err: any) {
+    console.warn("Live Radarr delete failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to delete movie in Radarr" });
   }
 
-  inMemoryRadarrMovies = inMemoryRadarrMovies.filter((m) => m.id !== id);
-  res.json({
-    success: true,
-    message: deleteFiles
-      ? "Movie and files deleted from disk successfully"
-      : "Movie removed from Radarr (files kept on disk)",
-    isLive: false,
-  });
+  res.status(400).json({ error: "Radarr instance not connected" });
 });
 
 // 5. Sonarr Series Proxy
 app.get("/api/sonarr/series", async (_req: Request, res: Response) => {
   try {
     const settings = await getAppSettings();
-    if (!settings.demoMode && settings.sonarr.enabled && settings.sonarr.url && settings.sonarr.apiKey) {
+    if (settings.sonarr.enabled && settings.sonarr.url && settings.sonarr.apiKey) {
       const cleanUrl = settings.sonarr.url.replace(/\/+$/, "");
       const response = await safeFetch(`${cleanUrl}/api/v3/series`, {
         headers: {
@@ -800,19 +928,19 @@ app.get("/api/sonarr/series", async (_req: Request, res: Response) => {
       }
     }
   } catch (err) {
-    console.warn("Live Sonarr fetch failed, falling back to mock:", err);
+    console.warn("Live Sonarr fetch failed:", err);
   }
 
-  res.json({ success: true, data: inMemorySonarrSeries, isLive: false });
+  res.json({ success: true, data: [], isLive: false });
 });
 
 app.patch("/api/sonarr/series/:id", async (req: Request, res: Response) => {
   const id = parseInt(req.params.id, 10);
-  const { qualityProfile, monitored } = req.body;
+  const { monitored } = req.body;
 
   try {
     const settings = await getAppSettings();
-    if (!settings.demoMode && settings.sonarr.enabled && settings.sonarr.url && settings.sonarr.apiKey) {
+    if (settings.sonarr.enabled && settings.sonarr.url && settings.sonarr.apiKey) {
       const cleanUrl = settings.sonarr.url.replace(/\/+$/, "");
       const getResp = await safeFetch(`${cleanUrl}/api/v3/series/${id}`, {
         headers: { "X-Api-Key": settings.sonarr.apiKey },
@@ -837,20 +965,12 @@ app.patch("/api/sonarr/series/:id", async (req: Request, res: Response) => {
         }
       }
     }
-  } catch (err) {
-    console.warn("Live Sonarr patch failed, falling back to mock:", err);
+  } catch (err: any) {
+    console.warn("Live Sonarr patch failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to update series in Sonarr" });
   }
 
-  const show = inMemorySonarrSeries.find((s) => s.id === id);
-  if (!show) {
-    res.status(404).json({ error: "Series not found" });
-    return;
-  }
-
-  if (qualityProfile !== undefined) show.qualityProfile = qualityProfile;
-  if (monitored !== undefined) show.monitored = monitored;
-
-  res.json({ success: true, data: show, isLive: false });
+  res.status(400).json({ error: "Sonarr instance not connected" });
 });
 
 app.delete("/api/sonarr/series/:id", async (req: Request, res: Response) => {
@@ -859,7 +979,7 @@ app.delete("/api/sonarr/series/:id", async (req: Request, res: Response) => {
 
   try {
     const settings = await getAppSettings();
-    if (!settings.demoMode && settings.sonarr.enabled && settings.sonarr.url && settings.sonarr.apiKey) {
+    if (settings.sonarr.enabled && settings.sonarr.url && settings.sonarr.apiKey) {
       const cleanUrl = settings.sonarr.url.replace(/\/+$/, "");
       const deleteResp = await safeFetch(
         `${cleanUrl}/api/v3/series/${id}?deleteFiles=${deleteFiles}`,
@@ -879,25 +999,19 @@ app.delete("/api/sonarr/series/:id", async (req: Request, res: Response) => {
         });
       }
     }
-  } catch (err) {
-    console.warn("Live Sonarr delete failed, falling back to mock:", err);
+  } catch (err: any) {
+    console.warn("Live Sonarr delete failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to delete series in Sonarr" });
   }
 
-  inMemorySonarrSeries = inMemorySonarrSeries.filter((s) => s.id !== id);
-  res.json({
-    success: true,
-    message: deleteFiles
-      ? "Series and all episode files deleted from disk successfully"
-      : "Series removed from Sonarr (files kept on disk)",
-    isLive: false,
-  });
+  res.status(400).json({ error: "Sonarr instance not connected" });
 });
 
 // 6. Plex Sessions & Stats Proxy
 app.get("/api/plex/status", async (_req: Request, res: Response) => {
   try {
     const settings = await getAppSettings();
-    if (!settings.demoMode && settings.plex.enabled && settings.plex.url && settings.plex.apiKey) {
+    if (settings.plex.enabled && settings.plex.url && settings.plex.apiKey) {
       const cleanUrl = settings.plex.url.replace(/\/+$/, "");
 
       const [sessionsResp, recentResp] = await Promise.all([
@@ -962,7 +1076,7 @@ app.get("/api/plex/status", async (_req: Request, res: Response) => {
           };
         });
 
-        let recentlyAdded: PlexRecentItem[] = mockPlexRecent;
+        let recentlyAdded: PlexRecentItem[] = [];
         if (recentResp.ok) {
           const rawRecent = await recentResp.json();
           const recentsMetadata = rawRecent.MediaContainer?.Metadata || [];
@@ -989,11 +1103,11 @@ app.get("/api/plex/status", async (_req: Request, res: Response) => {
             sessions,
             recentlyAdded,
             stats: {
-              totalMovies: 1420,
-              totalSeries: 185,
-              totalEpisodes: 8490,
-              storageUsedBytes: 42949672960000,
-              bandwidthMbps: 56.7,
+              totalMovies: 0,
+              totalSeries: 0,
+              totalEpisodes: 0,
+              storageUsedBytes: 0,
+              bandwidthMbps: 0,
             },
           },
           isLive: true,
@@ -1001,21 +1115,15 @@ app.get("/api/plex/status", async (_req: Request, res: Response) => {
       }
     }
   } catch (err) {
-    console.warn("Live Plex fetch failed, falling back to mock:", err);
+    console.warn("Live Plex fetch failed:", err);
   }
 
   res.json({
     success: true,
     data: {
-      sessions: mockPlexSessions,
-      recentlyAdded: mockPlexRecent,
-      stats: {
-        totalMovies: 1420,
-        totalSeries: 185,
-        totalEpisodes: 8490,
-        storageUsedBytes: 42949672960000,
-        bandwidthMbps: 56.7,
-      },
+      sessions: [],
+      recentlyAdded: [],
+      stats: emptyPlexStats,
     },
     isLive: false,
   });
@@ -1025,7 +1133,7 @@ app.get("/api/plex/status", async (_req: Request, res: Response) => {
 app.get("/api/qbittorrent/torrents", async (_req: Request, res: Response) => {
   try {
     const settings = await getAppSettings();
-    if (!settings.demoMode && settings.qbittorrent.enabled && settings.qbittorrent.url) {
+    if (settings.qbittorrent.enabled && settings.qbittorrent.url) {
       const cleanUrl = settings.qbittorrent.url.replace(/\/+$/, "");
       const headers = await getQBittorrentHeaders(settings.qbittorrent);
 
@@ -1061,7 +1169,7 @@ app.get("/api/qbittorrent/torrents", async (_req: Request, res: Response) => {
           };
         });
 
-        let stats = mockQbtStats;
+        let stats: QBittorrentStats = emptyQbtStats;
         if (transferResp.ok) {
           const tf = await transferResp.json();
           stats = {
@@ -1086,14 +1194,14 @@ app.get("/api/qbittorrent/torrents", async (_req: Request, res: Response) => {
       }
     }
   } catch (err) {
-    console.warn("Live qBittorrent fetch failed, falling back to mock:", err);
+    console.warn("Live qBittorrent fetch failed:", err);
   }
 
   res.json({
     success: true,
     data: {
-      torrents: inMemoryTorrents,
-      stats: mockQbtStats,
+      torrents: [],
+      stats: emptyQbtStats,
     },
     isLive: false,
   });
@@ -1104,7 +1212,7 @@ app.post("/api/qbittorrent/torrents/:hash/toggle", async (req: Request, res: Res
 
   try {
     const settings = await getAppSettings();
-    if (!settings.demoMode && settings.qbittorrent.enabled && settings.qbittorrent.url) {
+    if (settings.qbittorrent.enabled && settings.qbittorrent.url) {
       const cleanUrl = settings.qbittorrent.url.replace(/\/+$/, "");
       const headers = await getQBittorrentHeaders(settings.qbittorrent);
 
@@ -1123,18 +1231,12 @@ app.post("/api/qbittorrent/torrents/:hash/toggle", async (req: Request, res: Res
         return res.json({ success: true, isLive: true });
       }
     }
-  } catch (err) {
-    console.warn("Live qBittorrent toggle failed, falling back to mock:", err);
+  } catch (err: any) {
+    console.warn("Live qBittorrent toggle failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to toggle torrent in qBittorrent" });
   }
 
-  const torrent = inMemoryTorrents.find((t) => t.hash === hash);
-  if (!torrent) {
-    res.status(404).json({ error: "Torrent not found" });
-    return;
-  }
-
-  torrent.state = torrent.state === "downloading" ? "paused" : "downloading";
-  res.json({ success: true, data: torrent, isLive: false });
+  res.status(400).json({ error: "qBittorrent instance not connected" });
 });
 
 app.delete("/api/qbittorrent/torrents/:hash", async (req: Request, res: Response) => {
@@ -1143,7 +1245,7 @@ app.delete("/api/qbittorrent/torrents/:hash", async (req: Request, res: Response
 
   try {
     const settings = await getAppSettings();
-    if (!settings.demoMode && settings.qbittorrent.enabled && settings.qbittorrent.url) {
+    if (settings.qbittorrent.enabled && settings.qbittorrent.url) {
       const cleanUrl = settings.qbittorrent.url.replace(/\/+$/, "");
       const headers = await getQBittorrentHeaders(settings.qbittorrent);
 
@@ -1163,20 +1265,12 @@ app.delete("/api/qbittorrent/torrents/:hash", async (req: Request, res: Response
         });
       }
     }
-  } catch (err) {
-    console.warn("Live qBittorrent delete failed, falling back to mock:", err);
+  } catch (err: any) {
+    console.warn("Live qBittorrent delete failed:", err);
+    return res.status(500).json({ error: err.message || "Failed to delete torrent in qBittorrent" });
   }
 
-  inMemoryTorrents = inMemoryTorrents.filter((t) => t.hash !== hash);
-
-  res.json({
-    success: true,
-    message: deleteData
-      ? "Torrent and downloaded files removed from disk successfully"
-      : "Torrent removed from client (files kept on disk)",
-    deleteData,
-    isLive: false,
-  });
+  res.status(400).json({ error: "qBittorrent instance not connected" });
 });
 
 // 8. Service Connection Test Ping

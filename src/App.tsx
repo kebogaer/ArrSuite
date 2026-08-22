@@ -9,16 +9,10 @@ import { PlexTab } from './components/tabs/PlexTab';
 import { QBittorrentTab } from './components/tabs/QBittorrentTab';
 import { SettingsTab } from './components/tabs/SettingsTab';
 import {
+  emptyQbtStats,
   initialHealth,
   initialSettings,
-  mockPlexRecent,
-  mockPlexSessions,
-  mockQbtStats,
-  mockRadarrMovies,
-  mockSeerrRequests,
-  mockSonarrSeries,
-  mockTorrents
-} from './data/mockData';
+} from './data/defaults';
 import {
   ArrSettings,
   ParsedMediaLink,

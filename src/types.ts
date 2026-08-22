@@ -182,6 +182,14 @@ export interface PlexRecentItem {
   addedAt: string;
 }
 
+export interface PlexStats {
+  totalMovies: number;
+  totalSeries: number;
+  totalEpisodes: number;
+  storageUsedBytes: number;
+  bandwidthMbps: number;
+}
+
 export interface TorrentItem {
   hash: string;
   name: string;
